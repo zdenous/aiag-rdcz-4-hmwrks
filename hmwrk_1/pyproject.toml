@@ -1,0 +1,10 @@
+[project]
+name = "hmwrk-1-llm-api-tools"
+version = "0.1.0"
+description = "Úkol 1 - volání LLM API s nástrojem (function calling)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm==1.74.9",
+    "python-dotenv>=1.0.1",
+]
