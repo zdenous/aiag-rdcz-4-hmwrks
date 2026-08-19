@@ -1,0 +1,32 @@
+# Lokální Postgres jako alternativa k Supabase - stejné schéma i data.
+# Pro Supabase tenhle soubor nepotřebuješ.
+#
+#   docker compose up -d      # nastartuje a sám nahraje db/01_schema.sql a db/02_seed.sql
+#   docker compose down -v    # smaže i data
+#
+# n8n běžící v Dockeru se na tuhle databázi dostane přes host.docker.internal:5433.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aiag-hmwrk2-postgres
+    environment:
+      POSTGRES_DB: eshop
+      POSTGRES_USER: eshop
+      POSTGRES_PASSWORD: eshop
+    ports:
+      - "5433:5432"
+    volumes:
+      # soubory z docker-entrypoint-initdb.d se spustí v abecedním pořadí
+      # při prvním startu prázdného volume
+      - ./db:/docker-entrypoint-initdb.d:ro
+      - hmwrk2_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eshop -d eshop"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  hmwrk2_pgdata:

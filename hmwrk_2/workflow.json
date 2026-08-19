@@ -1,0 +1,443 @@
+{
+  "name": "Úkol 2 - E-shop agent nad databází",
+  "nodes": [
+    {
+      "parameters": {
+        "public": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -220,
+        -40
+      ],
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Chat: dotaz uživatele",
+      "webhookId": "7c1f0f9e-0001-4a10-9d31-eshopagent01"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "eshop-agent",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        180
+      ],
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Webhook: POST /eshop-agent",
+      "webhookId": "7c1f0f9e-0002-4a10-9d31-eshopagent02"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Sjednotí vstup ze dvou spouštěčů (chat widget / HTTP webhook)\n// do jednoho tvaru { dotaz, session_id, kanal }, se kterým dál pracuje agent.\nconst vystup = [];\n\nfor (const item of $input.all()) {\n  const j = item.json;\n\n  // Chat trigger posílá chatInput + sessionId, webhook má data v body.\n  const jeChat = j.chatInput !== undefined;\n  const body = j.body ?? {};\n\n  const dotaz = jeChat ? j.chatInput : (body.dotaz ?? body.question ?? body.chatInput ?? '');\n  if (!dotaz) {\n    throw new Error(\"Chybí dotaz. Webhook očekává JSON { \\\"dotaz\\\": \\\"...\\\" }.\");\n  }\n\n  vystup.push({\n    json: {\n      dotaz: String(dotaz),\n      session_id: String(jeChat ? (j.sessionId ?? 'chat') : (body.session_id ?? 'webhook')),\n      kanal: jeChat ? 'chat' : 'webhook',\n    },\n  });\n}\n\nreturn vystup;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        60
+      ],
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Sjednocení vstupu"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.dotaz }}",
+        "needsFallback": true,
+        "options": {
+          "systemMessage": "=Jsi asistent zákaznické podpory českého e-shopu s elektronikou. Odpovídáš česky, stručně a věcně.\nDnešní datum: {{ $now.format('yyyy-MM-dd') }}.\n\n## Nástroje\n- `db_schema` - vrátí seznam tabulek a sloupců z databáze. Použij, když si nejsi jistý strukturou.\n- `db_dotaz` - spustí SELECT nad databází a vrátí řádky. Tvůj hlavní nástroj.\n- `zaloz_tiket` - založí nový tiket zákaznické podpory (jediný zápis do databáze).\n- `kalkulacka` - přesná aritmetika. Použij ji na výpočty místo počítání z hlavy.\n\n## Schéma databáze (Postgres, schéma public)\n- `kategorie(id, nazev, popis)`\n- `zakaznici(id, jmeno, prijmeni, email, mesto, zeme, registrace, vip)` - `zeme` je 'CZ'/'SK', `vip` je boolean\n- `produkty(id, nazev, kategorie_id -> kategorie.id, znacka, cena_kc, skladem, hodnoceni, aktivni)`\n- `objednavky(id, zakaznik_id -> zakaznici.id, datum, stav, zpusob_platby, doprava_kc, celkem_kc)`\n  - `stav`: nova / zaplacena / odeslana / dorucena / stornovana\n  - `zpusob_platby`: karta / prevod / dobirka\n- `polozky_objednavky(id, objednavka_id -> objednavky.id, produkt_id -> produkty.id, mnozstvi, cena_ks_kc)`\n- `tikety(id, zakaznik_id -> zakaznici.id, predmet, popis, priorita, stav, vytvoreno)`\n  - `priorita`: nizka / normalni / vysoka, `stav`: otevreny / uzavreny\n\nCeny jsou v Kč. `polozky_objednavky.cena_ks_kc` je cena v době objednávky, může se lišit od `produkty.cena_kc`.\n\n## Pravidla pro SQL\n1. Nástroji `db_dotaz` předávej **jeden SELECT dotaz bez středníku na konci**. INSERT, UPDATE, DELETE ani DDL neprojdou - dotaz se spouští jako poddotaz.\n2. Text porovnávej přes `ILIKE` s procenty (`nazev ILIKE '%aurora%'`), diakritiku v datech neřeš přes LIKE bez procent.\n3. Agregace počítej v SQL (`SUM`, `COUNT`, `AVG`, `GROUP BY`), ne ručně nad vypsanými řádky.\n4. Chceš-li žebříček, přidej `ORDER BY ... DESC` a `LIMIT`. Nástroj sám vrací nejvýše 200 řádků.\n5. Stornované objednávky (`stav = 'stornovana'`) do tržeb nezapočítávej, pokud si o ně uživatel výslovně neřekne - a napiš, že jsi je vynechal.\n\n## Pravidla pro odpovědi\n- Čísla ber **jen z výsledků nástrojů**. Nikdy si nedomýšlej data, která ti databáze nevrátila.\n- Když dotaz nevrátí žádný řádek, řekni to otevřeně a nabídni upřesnění.\n- Když se uživatel ptá nejednoznačně (např. \"poslední měsíc\"), zvol rozumný výklad a napiš, jaký jsi zvolil.\n- Tiket zakládej jen na výslovnou žádost. Když neznáš zákazníka, dohledej ho podle e-mailu nebo jména přes `db_dotaz`; pokud ho nenajdeš, založ tiket bez `zakaznik_id`.\n- U delších výsledků použij krátkou markdown tabulku.",
+          "maxIterations": 12,
+          "returnIntermediateSteps": false
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        260,
+        60
+      ],
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "AI Agent",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "openai/gpt-oss-20b:free"
+        },
+        "options": {
+          "baseURL": "https://openrouter.ai/api/v1",
+          "temperature": 0.1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        140,
+        300
+      ],
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "OpenRouter Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "PLACEHOLDER_LLM",
+          "name": "OpenRouter"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "nvidia/nemotron-3-super-120b-a12b:free"
+        },
+        "options": {
+          "baseURL": "https://openrouter.ai/api/v1",
+          "temperature": 0.1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        140,
+        460
+      ],
+      "id": "a1000000-0000-4000-8000-000000000015",
+      "name": "Záložní model (OpenRouter)",
+      "credentials": {
+        "openAiApi": {
+          "id": "PLACEHOLDER_LLM",
+          "name": "OpenRouter"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.session_id }}",
+        "contextWindowLength": 12
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [
+        320,
+        300
+      ],
+      "id": "a1000000-0000-4000-8000-000000000006",
+      "name": "Paměť konverzace"
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Vrátí seznam všech tabulek a jejich sloupců (název, datový typ, nullable) ve schématu public. Volej bez parametrů, když potřebuješ ověřit strukturu databáze.",
+        "operation": "executeQuery",
+        "query": "SELECT c.table_name  AS tabulka,\n       c.column_name AS sloupec,\n       c.data_type   AS typ,\n       c.is_nullable AS muze_byt_null\nFROM information_schema.columns c\nJOIN information_schema.tables t\n  ON t.table_schema = c.table_schema AND t.table_name = c.table_name\nWHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'\nORDER BY c.table_name, c.ordinal_position",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        480,
+        300
+      ],
+      "id": "a1000000-0000-4000-8000-000000000007",
+      "name": "db_schema",
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_PG",
+          "name": "Postgres eshop (Supabase)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Spustí SELECT dotaz nad e-shopovou databází a vrátí nalezené řádky (max. 200). Vstup 'sql' je jeden SELECT v Postgres syntaxi bez středníku. Zápisové příkazy nejsou povolené.",
+        "operation": "executeQuery",
+        "query": "=SELECT * FROM (\n{{ $fromAI('sql', 'Jeden SELECT dotaz v Postgres syntaxi, bez středníku na konci. Může obsahovat JOINy, agregace, ORDER BY i LIMIT.', 'string').trim().replace(/;+\\s*$/, '') }}\n) AS agent_dotaz LIMIT 200",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        640,
+        300
+      ],
+      "id": "a1000000-0000-4000-8000-000000000008",
+      "name": "db_dotaz",
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_PG",
+          "name": "Postgres eshop (Supabase)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Založí nový tiket zákaznické podpory v tabulce tikety a vrátí jeho ID. Používej jen na výslovnou žádost uživatele.",
+        "operation": "executeQuery",
+        "query": "INSERT INTO tikety (zakaznik_id, predmet, popis, priorita)\nVALUES (NULLIF($1, 0), $2, $3, $4)\nRETURNING id, zakaznik_id, predmet, priorita, stav, vytvoreno",
+        "options": {
+          "queryReplacement": "={{ [ $fromAI('zakaznik_id', 'ID zákazníka z tabulky zakaznici. Když zákazníka neznáš, pošli 0.', 'number', 0), $fromAI('predmet', 'Krátký předmět tiketu, do 80 znaků.', 'string'), $fromAI('popis', 'Popis problému nebo dotazu vlastními slovy zákazníka.', 'string'), $fromAI('priorita', 'Priorita: nizka, normalni nebo vysoka.', 'string', 'normalni') ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        800,
+        300
+      ],
+      "id": "a1000000-0000-4000-8000-000000000009",
+      "name": "zaloz_tiket",
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_PG",
+          "name": "Postgres eshop (Supabase)"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolCalculator",
+      "typeVersion": 1,
+      "position": [
+        960,
+        300
+      ],
+      "id": "a1000000-0000-4000-8000-000000000010",
+      "name": "kalkulacka"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $('Sjednocení vstupu').first().json.kanal }}",
+              "rightValue": "webhook",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        560,
+        60
+      ],
+      "id": "a1000000-0000-4000-8000-000000000011",
+      "name": "Přišlo to z webhooku?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ odpoved: $json.output ?? ('Agenta se nepodařilo dokončit: ' + ($json.error?.message ?? 'neznámá chyba, zkus dotaz zopakovat')), dotaz: $('Sjednocení vstupu').first().json.dotaz, session_id: $('Sjednocení vstupu').first().json.session_id }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        800,
+        20
+      ],
+      "id": "a1000000-0000-4000-8000-000000000012",
+      "name": "Odpověď webhooku"
+    },
+    {
+      "parameters": {
+        "content": "## Než workflow spustíš\n\n1. **Credential `Postgres eshop (Supabase)`** - Supabase → Connect → Session pooler:\n   - Host: `aws-1-<region>.pooler.supabase.com`\n   - Database: `postgres`, User: `postgres.<project-ref>`\n   - Port: `5432`, SSL: **require**\n2. **Credential `OpenRouter`** (typ OpenAI) - API klíč z openrouter.ai.\n   Používají ho oba modelové nody, Base URL je nastavená v nich.\n3. V databázi spusť `db/01_schema.sql` a `db/02_seed.sql`.",
+        "height": 320,
+        "width": 380,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -620,
+        -60
+      ],
+      "id": "a1000000-0000-4000-8000-000000000013",
+      "name": "Poznámka: nastavení"
+    },
+    {
+      "parameters": {
+        "content": "## Vyzkoušej v chatu\n\n- Kolik máme zákazníků a kolik z nich je VIP?\n- Které tři produkty vydělaly nejvíc? Sečti to z položek objednávek.\n- Kolik jsme utržili v červenci 2026?\n- Máme skladem něco od značky Vela?\n- Jaká je průměrná hodnota objednávky u plateb kartou?\n- Založ tiket pro jana.novakova@example.cz: nedorazila faktura, priorita vysoka.",
+        "height": 320,
+        "width": 380,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -620,
+        300
+      ],
+      "id": "a1000000-0000-4000-8000-000000000014",
+      "name": "Poznámka: ukázkové dotazy"
+    }
+  ],
+  "connections": {
+    "Chat: dotaz uživatele": {
+      "main": [
+        [
+          {
+            "node": "Sjednocení vstupu",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: POST /eshop-agent": {
+      "main": [
+        [
+          {
+            "node": "Sjednocení vstupu",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sjednocení vstupu": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Přišlo to z webhooku?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Přišlo to z webhooku?": {
+      "main": [
+        [
+          {
+            "node": "Odpověď webhooku",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "OpenRouter Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Záložní model (OpenRouter)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Paměť konverzace": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "db_schema": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "db_dotaz": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "zaloz_tiket": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "kalkulacka": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false,
+  "tags": []
+}
