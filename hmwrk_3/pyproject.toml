@@ -1,0 +1,14 @@
+[project]
+name = "hmwrk-3-langgraph-mcp-agent"
+version = "0.1.0"
+description = "Úkol 3 - ReAct agent v LangGraphu s nástroji přes MCP"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=0.6.0",
+    "langchain-mcp-adapters>=0.1.0",
+    "langchain-openai>=0.3.0",
+    "mcp>=1.13.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.1",
+]
