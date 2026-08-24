@@ -42,8 +42,9 @@ a jejich výstupy vrátí do stavu jako `ToolMessage`. Hrana zpět do `agent`
 uzavírá smyčku — a ta se točí, dokud model nevrátí odpověď bez volání nástroje.
 
 Stav grafu je jen seznam zpráv (reducer `add_messages`) plus počítadlo kol.
-Po `MAX_KROKU` kolech dostane model **stejný dotaz bez nástrojů**, takže musí
-odpovědět textem; smyčka se tím nemůže zaseknout donekonečna.
+Po `MAX_KROKU` kolech dostane model **stejný dotaz bez nástrojů**, takže má
+odpovědět textem z toho, co už zjistil — a hrana pak vede na `END`, ať model
+vrátí cokoli. Smyčka se tím nemůže zaseknout donekonečna.
 
 ## Proč MCP, a ne nástroje napsané pro LangChain
 
@@ -127,7 +128,7 @@ agent by na Wikipedii nikdy nemusel sáhnout.
 ```bash
 uv sync
 uv run scripts/build_db.py       # postaví data/knihovna.db a fulltextový index
-cp .env.example .env             # doplň OPENROUTER_API_KEY
+cp .env.example .env             # doplň GEMINI_API_KEY
 uv run agent.py
 ```
 
@@ -186,14 +187,69 @@ s konfigurací MCP serverů) se přidá takhle:
 
 ## Model
 
-Výchozí je free tier OpenRouteru, aby úkol šel spustit bez placeného klíče.
-Agent mluví s obyčejným OpenAI-kompatibilním API, takže přepnutí na OpenAI,
-LiteLLM proxy z podkladů kurzu nebo na lokální Ollamu je jen otázka `.env`
-(`LLM_BASE_URL`, `LLM_API_KEY`, `MODEL`) — v kódu se nemění nic.
+Výchozí je **Gemini free tier** (Google AI Studio), aby úkol šel spustit bez
+placeného klíče. Model se zapisuje s prefixem poskytovatele:
 
-Model **musí umět tool calling**, jinak agent nezavolá jediný nástroj. Aktuální
-seznam free modelů, které ho mají, vrátí veřejné API OpenRouteru (klíč není
-potřeba):
+| Zápis v `MODEL` | Klient | Klíč |
+|---|---|---|
+| `google/gemini-3.7-flash` (výchozí) | `ChatGoogleGenerativeAI` (nativní Gemini API) | `GEMINI_API_KEY` |
+| `openrouter/z-ai/glm-5.2:free` | `ChatOpenAI` na `openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| cokoli bez známého prefixu | `ChatOpenAI` na `LLM_BASE_URL` | `LLM_API_KEY` |
+
+Poslední řádek pokrývá OpenAI, LiteLLM proxy z podkladů kurzu i lokální Ollamu —
+všechno jsou OpenAI-kompatibilní API, takže se mění jen `.env`, v kódu nic.
+
+**Náhradní modely můžou být od jiného poskytovatele než ten hlavní.** Výchozí
+řetězec je `gemini-3.7-flash` → `gemini-3.6-flash` → dva free modely
+z OpenRouteru; každý model si nese vlastní klienta i klíč. Model, ke kterému
+chybí klíč, agent při startu přeskočí a napíše to — takže bez `GEMINI_API_KEY`
+běží rovnou na OpenRouteru.
+
+### Proč u Gemini nativní klient, a ne OpenAI-kompatibilní endpoint
+
+Gemini má OpenAI-kompatibilní endpoint
+(`generativelanguage.googleapis.com/v1beta/openai/`) a přes `ChatOpenAI` na něj
+jde poslat první dotaz i s nástroji. Druhý tah ale skončí:
+
+```
+400 Function call is missing a thought_signature in functionCall parts.
+    This is required for tools to work correctly …
+```
+
+Modely řady Gemini 3 vracejí u každého volání nástroje **thought signature** —
+zašifrovaný otisk svého uvažování — a při dalším tahu ji musí klient poslat
+zpátky. Kompatibilní vrstva ji do OpenAI schématu nemá kam dát, `ChatOpenAI` ji
+zahodí (v `additional_kwargs` zůstane jen `refusal`) a agent umře hned po prvním
+nástroji. Není to chyba v tomhle projektu — naráží na to Codex, OpenAI Agents SDK
+i další klienti přes kompatibilní vrstvu.
+
+Nativní `langchain-google-genai` signatury přenáší sám
+(`__gemini_function_call_thought_signatures__` v `additional_kwargs`), takže
+ReAct smyčka nad Gemini 3 funguje. Cena je jedna závislost navíc a jedna větev
+v `chat()`; zbytek agenta ani nástrojů se to netýká.
+
+Ústup na starší Gemini bez tohohle chování nefunguje — `gemini-2.5-flash` už
+Google novým klíčům nedává:
+
+```
+404 This model models/gemini-2.5-flash is no longer available to new users.
+    Please update your code to use models/gemini-3.6-flash …
+```
+
+Modely, na které tvůj klíč dosáhne:
+
+```bash
+curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY" | grep '"name"'
+```
+
+Kvóty free tieru (na minutu i na den) se liší podle modelu a jsou vidět
+v [AI Studiu](https://aistudio.google.com/). Když 3.7 nestačí, menší varianty
+jsou `google/gemini-3.6-flash` a `google/gemini-3.5-flash-lite`.
+
+### OpenRouter jako záloha
+
+Free model na OpenRouteru **musí umět tool calling**, jinak agent nezavolá
+jediný nástroj. Aktuální seznam vrátí veřejné API (klíč není potřeba):
 
 ```bash
 curl -s https://openrouter.ai/api/v1/models | python3 -c "import json,sys; [print(m['id']) for m in json.load(sys.stdin)['data'] if m['id'].endswith(':free') and 'tools' in (m.get('supported_parameters') or [])]"
@@ -201,11 +257,10 @@ curl -s https://openrouter.ai/api/v1/models | python3 -c "import json,sys; [prin
 
 Nabídka se mění — model `openai/gpt-oss-20b:free`, na kterém běžely úkoly 1 a 2,
 už ve free variantě neexistuje (OpenRouter na něj vrací 404 s odkazem na placenou
-verzi). Ověřeno 24. 8. 2026: tool calling má 14 z 15 free modelů. Výchozí je
-`nvidia/nemotron-3-super-120b-a12b:free`, náhradní `z-ai/glm-5.2:free`
-a `google/gemma-4-31b-it:free`. Nemotron je z nich nejspolehlivěji dostupný;
-GLM dává hezčí české odpovědi, ale ten den byl skoro pořád 429 — proto je
-jako záloha.
+verzi). Ověřeno 24. 8. 2026: tool calling má 14 z 15 free modelů. Jako záloha
+jsou nastavené `nvidia/nemotron-3-super-120b-a12b:free` (nejspolehlivěji
+dostupný) a `z-ai/glm-5.2:free` (hezčí české odpovědi, ale ten den skoro pořád
+429).
 
 Free modely mají navíc **strop 50 požadavků za den na účet** (s kreditem 10 $
 je to 1000). Jeden běh všech ukázkových dotazů spotřebuje 15–20 volání LLM, takže
@@ -235,45 +290,65 @@ Další, které stojí za vyzkoušení:
 
 ## Ověřený běh
 
-Spuštěno 24. 8. 2026 proti free tieru OpenRouteru, model
-`nvidia/nemotron-3-super-120b-a12b:free`, MCP přes stdio. Odpovědi agenta jsou
-porovnané s tím, co vrátí stejná otázka puštěná ručně nad databází:
+Spuštěno 24. 8. 2026, MCP přes stdio. Odpovědi agenta jsou porovnané s tím, co
+vrátí stejná otázka puštěná ručně nad databází:
 
-| Dotaz | Odpověď agenta | Kontrola v DB |
-|---|---|---|
-| Tři nejpůjčovanější knihy + nevrácené po termínu | Babička 12, Postřižiny 11, Žert 11; 7 nevrácených po termínu | `12, 11, 11` a `7` ✓ |
-| Stížnosti na překlad / poškozený výtisk | překlad: Norské dřevo; poškozené: Bratři Karamazovi, Švejk, Stařec a moře | ✓ (a správně nepočítá pochvalu nového překladu Zločinu a trestu jako stížnost) |
-| Nositelé Nobelovy ceny v katalogu | Lagerlöfová 1, Hemingway 2, García Márquez 2, Morrisonová 2, Lessingová 1, Ishiguro 2, Tokarczuková 2 | 7 autorů, 12 knih ✓ |
-| Report o pěti nejpůjčovanějších knihách 2026 | Hana 6; Krakatit, Postřižiny, Žert a Kniha smíchu a zapomnění po 5 | ✓ včetně průměrných hodnocení; soubor `out/zebricek-2026.md` vznikl |
-| „Smaž stornované recenze" | odmítne s vysvětlením | data beze změny ✓ |
+| Dotaz | Odpověď agenta | Kontrola v DB | Model |
+|---|---|---|---|
+| Tři nejpůjčovanější knihy + nevrácené po termínu | Babička 12, Postřižiny 11, Žert 11; 7 nevrácených po termínu | `12, 11, 11` a `7` ✓ | `gemini-3.7-flash` |
+| Stížnosti na překlad / poškozený výtisk | překlad: Norské dřevo; poškozené: Bratři Karamazovi, Švejk, Stařec a moře | ✓ (a správně nepočítá pochvalu nového překladu Zločinu a trestu jako stížnost) | `gemini-3.7-flash` |
+| Nositelé Nobelovy ceny v katalogu | Lagerlöfová 1, Hemingway 2, García Márquez 2, Morrisonová 2, Lessingová 1, Ishiguro 2, Tokarczuková 2 | 7 autorů, 12 knih ✓ | `nemotron-3-super` |
+| Report o pěti nejpůjčovanějších knihách 2026 | Hana 6; Markéta Lazarová, Kniha smíchu a zapomnění, Žert a Postřižiny po 5 | ✓ i s průměrnými hodnoceními; soubor `out/zebricek-2026.md` vznikl | `gemini-3.5-flash-lite` |
+| Konverzace: „Kolik máme knih od Lindgrenové?" → „A která z nich je nejdelší?" | Pipi Dlouhá punčocha, 768 stran | ✓ druhý tah navázal bez zopakování jména autorky | `gemini-3.6-flash` |
+| „Smaž všechny recenze s hodnocením 1" | odmítne s vysvětlením, že databáze je jen pro čtení | data beze změny ✓ | `gemini-3.6-flash` |
 
-Takhle vypadá běh na dotazu, který potřebuje fulltext (zkráceno):
+Sloupec s modelem není kosmetika: free kvóty se během testování postupně
+vyčerpaly a jednotlivé dotazy dobíhaly na tom modelu, který zrovna odpovídal.
+Přepínání řešil fallback sám, v `.env` se nesahalo.
+
+Takhle vypadá běh na dotazu, který potřebuje dva různé zdroje (zkráceno) —
+Gemini si oba dotazy vyžádalo v jednom kole vedle sebe:
 
 ```
-=== Dotaz: Stěžoval si někdo z čtenářů na překlad nebo na poškozený výtisk?
+=== Dotaz: Které tři knihy se u nás nejvíc půjčovaly? A kolik máme nevrácených výpůjček po termínu?
 
 --- Krok 1: přemýšlí LLM ---
-  → nástroj hledej_v_recenzich({'dotaz': 'překlad OR poškozený OR poškození OR vytisk OR tisk', 'limit': 20})
-  ← Bratři Karamazovi (Fjodor Michajlovič Dostojevskij) - 2/5, Hana Černá, 2025-08-31 Bratři Karamazovi -
-    výtisk je poškozený, chybí strany 210 až 226. …
+  → nástroj db_schema({})
+  ← CREATE TABLE autori ( id INTEGER PRIMARY KEY, … ); -- řádků: 28 …
 
 --- Krok 2: přemýšlí LLM ---
+  → nástroj db_dotaz({'sql': 'SELECT k.nazev, a.jmeno AS autor, COUNT(v.id) … LIMIT 3'})
+  ← nazev | autor | pocet_vypujcek … Babička | Božena Němcová | 12 …
+  → nástroj db_dotaz({'sql': "SELECT COUNT(*) … WHERE vraceno_dne IS NULL AND datum_do < '2026-08-24'"})
+  ← pocet_nevracenych_po_terminu ---------------------------- 7 (1 řádků)
+
+--- Krok 3: přemýšlí LLM ---
+  (hlavní model selhal, odpověděl náhradní gemini-3.6-flash)
 
 Odpověď agenta:
-Ano, čtenáři si stěžovali jak na překlad, tak na poškozené výtisky.
+Podle údajů z naší databáze jsou tři nejvíce půjčované knihy:
+1. **Babička** (Božena Němcová) – 12 výpůjček
 …
 ```
-
-Dotaz na Nobelovy ceny běžel po úpravě nástroje `wikipedia_hledej` (viz níže);
-zbylé tři jsou z jednoho společného běhu. Režim `--chat` se ten den ověřit
-nepodařilo — došel denní limit free modelů (viz níže). Prochází stejnou cestou
-grafem jako ostatní dotazy, liší se jen tím, že všechny tahy sdílejí `thread_id`.
 
 Nástroje samotné jdou ověřit i bez LLM, a to kdykoli: `uv run scripts/test_mcp.py`
 projde všech šest nástrojů včetně pokusů o zápis do databáze — poslední spuštění
 prošlo celé.
 
 ### Co běh ukázal
+
+**Kompatibilní endpoint není totéž co nativní klient.** Popsané výš u modelů:
+Gemini 3 přes OpenAI-kompatibilní vrstvu spadne hned po prvním nástroji, protože
+se cestou ztratí thought signature. Zjistí se to až druhým tahem, takže „první
+dotaz prošel" nic negarantuje — agenta je potřeba proklepnout přes celou smyčku.
+
+**Model bez nástrojů ještě neznamená konec smyčky.** Poslední kolo se schválně
+volá bez nástrojů, aby model musel odpovědět textem. Nemotron to tak udělal,
+Gemini ne — funkce v požadavku nebyly, model si je odvodil z historie a poslal
+`functionCall` znovu. Podmíněná hrana ho tím pádem pustila zpátky do uzlu
+s nástroji a graf běžel až do `recursion_limitu`. Pojistka musí být v grafu, ne
+v tom, co se pošle modelu: po posledním kole vede hrana na `END` bez ohledu na
+to, co model vrátil.
 
 **Model si sám rozbil počty JOINem.** Na report za rok 2026 napsal jeden dotaz,
 který spojil výpůjčky i recenze naráz — řádky se pronásobily a z pěti výpůjček
@@ -302,11 +377,12 @@ není jen v tom, co umí zavolat, ale co vrátí zpátky do kontextu.
 zafungovalo tak, jak mělo — místo nekonečné smyčky nebo výjimky přišla hotová
 odpověď z toho, co už zjistil, a byla správně.
 
-**Free tier má strop 50 požadavků za den.** Jedno spuštění všech čtyř
-ukázkových dotazů spotřebuje zhruba 15–20 volání LLM, takže tři čtyři běhy
-denní limit vyčerpají. Pak vrací OpenRouter 429 s `free-models-per-day`
-a nepomůže ani přepnutí modelu — limit je na účet, ne na model. Agent to pozná
-a napíše to:
+**Free kvóty dojdou dřív, než čekáš.** Jedno spuštění všech čtyř ukázkových
+dotazů spotřebuje 15–20 volání LLM. OpenRouter má na free modely strop
+50 požadavků za den **na účet** (`free-models-per-day`), takže přepnutí modelu
+nepomůže; Gemini má strop zvlášť na minutu a na den **na model**, takže tam
+fallback na jinou variantu (3.7 → 3.6 → 3.5-flash-lite) smysl dává a během
+testování opakovaně naskočil. Agent obojí pozná a napíše to:
 
 ```
 Dotaz se nepodařilo dokončit.
@@ -328,22 +404,27 @@ napsaný ručně, protože o to v úkolu jde — je vidět, že ReAct není nic 
 uzly a jedna podmíněná hrana. Navíc se do uzlů vešlo počítadlo kol a výpis toho,
 co agent zrovna dělá, což by se u prebuiltu řešilo callbacky.
 
-**Strop na počet kol.** `recursion_limit` v LangGraphu by běh utnul výjimkou
-uprostřed práce. Místo toho si agent počítá kola sám a v posledním dostane model
-bez nástrojů — musí tedy odpovědět textem z toho, co už zjistil. Uživatel
-dostane odpověď, ne traceback.
+**Strop na počet kol, dvakrát.** `recursion_limit` v LangGraphu by běh utnul
+výjimkou uprostřed práce. Místo toho si agent počítá kola sám: v posledním kole
+dostane model bez nástrojů, takže má odpovědět textem z toho, co už zjistil —
+a podmíněná hrana pak vede na `END` bez ohledu na to, co model vrátil. Ta druhá
+pojistka není zbytečná, viz „Model bez nástrojů ještě neznamená konec smyčky"
+výš. Když v poslední zprávě žádný text není, dostane uživatel aspoň hlášku
+o vyčerpaném limitu, ne prázdnou odpověď.
 
 **Paměť.** Graf se kompiluje s `InMemorySaver`, historii drží `thread_id`.
 V režimu `--chat` proto navazující dotaz („a který z nich je nejstarší?")
 funguje; každý ukázkový dotaz naopak běží ve vlastním vlákně, ať se kontexty
 nemíchají. Na produkci by stačilo vyměnit checkpointer za `SqliteSaver`.
 
-**Náhradní modely.** Free modely sdílí kapacitu s ostatními uživateli a 429 je
-běžný stav, ne výjimka. Řeší to `.with_fallbacks()` přímo z LangChainu.
-Jedna past: `llm.bind(model="jiný").bind_tools(tools)` **nefunguje** —
-`bind_tools()` se aplikuje na původní model a nastavení z `bind()` zahodí,
-takže by fallback volal pořád dokola ten samý model. Každý model proto musí být
-vlastní instance `ChatOpenAI`.
+**Náhradní modely, klidně od jiného poskytovatele.** Free kapacita vypadává a 429
+je běžný stav, ne výjimka. Řeší to `.with_fallbacks()` přímo z LangChainu: hlavní
+model jede na Gemini, zálohy na OpenRouteru, a protože je každý model vlastní
+instance `ChatOpenAI`, nese si každý svoji adresu i klíč. Model bez klíče se
+ze seznamu vyhodí ještě před startem, aby jen nezdržoval o jedno 401.
+Zkratka `llm.bind(model="jiný").bind_tools(tools)` je slepá ulička —
+`bind_tools()` se aplikuje na původní model a nastavení z `bind()` zahodí, takže
+by fallback volal pořád dokola ten samý model. Proto ty samostatné instance.
 
 **Jedno MCP sezení na celý běh.** `MultiServerMCPClient.get_tools()` otevírá
 nové sezení při každém volání nástroje — u stdio transportu by to znamenalo
@@ -368,7 +449,11 @@ a míjí tvary s jinou diakritikou.
 |---|---|
 | Agent odpoví, ale nezavolá žádný nástroj | Model neumí tool calling. Přepni `MODEL` na některý z ověřených (viz sekce Model). |
 | `404 - This model is unavailable for free` | Free varianta modelu na OpenRouteru skončila. Vytáhni si aktuální seznam příkazem výše a přepiš `MODEL`. |
-| `Všechny nastavené modely vrátily 429` | Výpadek sdíleného poolu free modelů. Zkus to za chvíli znovu, nebo doplň další model do `FALLBACK_MODELS`. |
+| `Neodpověděl ani jeden z modelů` | Hláška vypíše, které modely se zkoušely, a chybu toho prvního. Doplň další model do `FALLBACK_MODELS`, nebo zkus za chvíli znovu. |
+| `missing a thought_signature` | Gemini 3 přes OpenAI-kompatibilní endpoint. `MODEL` musí mít prefix `google/`, aby se použil nativní klient (viz sekce Model). |
+| `Model je přetížený (503)` | Dočasné vytížení Gemini. Naskočí další model z `FALLBACK_MODELS`, jinak zkus za pár minut znovu. |
+| `Poskytovatel odmítl API klíč` | Chybný nebo cizí `GEMINI_API_KEY`. Klíč se dělá na <https://aistudio.google.com/apikey>. |
+| `Vyčerpaná kvóta poskytovatele` | Gemini free tier má strop na minutu i na den. Počkej, přepni na menší model, nebo nech naskočit fallback. |
 | `Vyčerpaný denní limit free modelů` | 50 požadavků na den na účet (nuluje se o půlnoci UTC). Přepnutí modelu nepomůže — počkej, dokup kredit (10 $ zvedne limit na 1000/den), nebo přepni provider. |
 | `Chybí databáze` | `uv run scripts/build_db.py`. |
 | `attempt to write a readonly database` ve výpisu nástroje | Očekávané chování — agent zkusil změnit data a SQLite ho nepustil. |

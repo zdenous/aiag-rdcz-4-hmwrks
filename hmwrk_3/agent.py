@@ -24,43 +24,101 @@ Spuštění:
 """
 
 import asyncio
+import logging
 import os
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any, Sequence, TypedDict
+from typing import Annotated, Any, NamedTuple, Sequence, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 load_dotenv()
 
+# google-genai vypíše ke každému volání odstavec o "automatic function calling",
+# který se tady netýká ničeho - nástroje si volá agent sám.
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+
 KOREN = Path(__file__).resolve().parent
 
 # --- LLM ------------------------------------------------------------------
-# Výchozí je free tier OpenRouteru (stejný klíč jako v úkolech 1 a 2). Protože
-# jde o obyčejné OpenAI-kompatibilní API, stačí přepsat LLM_BASE_URL a MODEL
-# a agent běží nad LiteLLM proxy, Ollamou i placeným OpenAI.
-MODEL = os.environ.get("MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
-# Free modely sdílí kapacitu s ostatními uživateli a občas vrátí 429. Fallbacky
-# řeší přímo LangChain (.with_fallbacks), takže se to nikde neprogramuje ručně.
+# Model se zapisuje s prefixem poskytovatele, stejně jako v úkolu 1:
+#   google/gemini-3.7-flash        -> nativní klient Gemini API (viz chat())
+#   openrouter/z-ai/glm-5.2:free   -> OpenRouter
+#   cokoli bez známého prefixu     -> LLM_BASE_URL + LLM_API_KEY
+#                                     (OpenAI, LiteLLM proxy, Ollama, LM Studio…)
+# Kromě Gemini jsou to všechno OpenAI-kompatibilní API, takže se mění jen adresa,
+# klíč a jméno modelu - kód zůstává stejný.
+MODEL = os.environ.get("MODEL", "google/gemini-3.7-flash")
+# Náhradní modely mohou být od jiného poskytovatele než ten hlavní. Free modely
+# na OpenRouteru sdílí kapacitu s ostatními uživateli a občas vrátí 429; přepnutí
+# na ně řeší .with_fallbacks() z LangChainu, nic se neprogramuje ručně.
 FALLBACK_MODELS = [
     m.strip()
     for m in os.environ.get(
         "FALLBACK_MODELS",
-        "z-ai/glm-5.2:free,google/gemma-4-31b-it:free",
+        "google/gemini-3.6-flash"
+        ",google/gemini-3.5-flash-lite"
+        ",openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+        ",openrouter/z-ai/glm-5.2:free",
     ).split(",")
     if m.strip()
 ]
+
+# prefix -> (adresa API, proměnné prostředí s klíčem v pořadí, jak se zkoušejí)
+POSKYTOVATELE = {
+    "google": (None, ("GEMINI_API_KEY", "GOOGLE_API_KEY")),  # adresu řeší nativní klient
+    "openrouter": ("https://openrouter.ai/api/v1", ("OPENROUTER_API_KEY",)),
+}
+
+
+class Spec(NamedTuple):
+    """Rozložený zápis modelu."""
+
+    nazev: str
+    adresa: str | None
+    klic: str
+    poskytovatel: str  # "" = vlastní OpenAI-kompatibilní endpoint
+
+
+def rozloz_model(zapis: str) -> Spec:
+    """'google/gemini-3.7-flash' -> Spec('gemini-3.7-flash', None, klíč, 'google')."""
+    prefix, _, zbytek = zapis.partition("/")
+    if prefix in POSKYTOVATELE and zbytek:
+        # pozor: jméno modelu samo obsahuje lomítka (openrouter/z-ai/glm-5.2:free),
+        # takže se odřízne jen první část
+        adresa, promenne = POSKYTOVATELE[prefix]
+        klic = next((os.environ[p] for p in promenne if os.environ.get(p)), "")
+        return Spec(zbytek, adresa, klic, prefix)
+    return Spec(
+        zapis,
+        os.environ.get("LLM_BASE_URL") or None,  # None = výchozí OpenAI endpoint
+        os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "",
+        "",
+    )
+
+
+def pouzitelne_modely() -> list[str]:
+    """Modely v pořadí, jak se mají zkoušet; ty bez klíče se přeskočí."""
+    poradi = [MODEL, *[m for m in FALLBACK_MODELS if m != MODEL]]
+    # Bez klíče by model spadl na 401 a jen zdržel. Vlastní endpointy (Ollama,
+    # LiteLLM) klíč mít nemusí, takže se u nich nekontroluje.
+    return [
+        zapis
+        for zapis in poradi
+        if rozloz_model(zapis).klic or not rozloz_model(zapis).poskytovatel
+    ]
 
 # --- MCP ------------------------------------------------------------------
 # stdio = agent si server spustí sám jako podproces (nic se nemusí startovat
@@ -144,11 +202,23 @@ def _zkrat(text: Any, limit: int = 220) -> str:
 def postav_graf(nastroje: Sequence[BaseTool]):
     """Poskládá ReAct smyčku: uzel s LLM, uzel s nástroji a podmíněná hrana mezi nimi."""
 
-    def chat(model: str) -> ChatOpenAI:
+    def chat(zapis: str) -> BaseChatModel:
+        spec = rozloz_model(zapis)
+        if spec.poskytovatel == "google":
+            # Gemini má sice OpenAI-kompatibilní endpoint, ale přes něj se ztrácí
+            # "thought signature", kterou modely řady Gemini 3 vyžadují vrátit
+            # u každého volání nástroje. Druhý tah pak skončí chybou 400. Nativní
+            # klient signatury přenáší sám, takže Google jede přes něj.
+            return ChatGoogleGenerativeAI(
+                model=spec.nazev,
+                google_api_key=spec.klic,
+                timeout=120,
+                max_retries=2,
+            )
         return ChatOpenAI(
-            model=model,
-            base_url=LLM_BASE_URL,
-            api_key=LLM_API_KEY,
+            model=spec.nazev,
+            base_url=spec.adresa,
+            api_key=spec.klic or "nic",  # lokální endpointy klíč nekontrolují
             temperature=0,
             timeout=120,
             max_retries=2,  # klient sám zopakuje 429 podle hlavičky Retry-After
@@ -161,12 +231,13 @@ def postav_graf(nastroje: Sequence[BaseTool]):
     # llm.bind(model=...).bind_tools(...) nefunguje, bind_tools() se aplikuje na
     # původní model a nastavení z bind() zahodí - fallback by pak volal pořád
     # dokola ten samý model.
-    modely = [MODEL, *[m for m in FALLBACK_MODELS if m != MODEL]]
+    modely = pouzitelne_modely()
     llm_s_nastroji = chat(modely[0]).bind_tools(nastroje).with_fallbacks(
         [chat(nahradni).bind_tools(nastroje) for nahradni in modely[1:]]
     )
-    # Poslední kolo běží bez nástrojů - model tím pádem musí odpovědět textem
-    # a smyčka se nemůže točit donekonečna.
+    # Poslední kolo běží bez nástrojů, aby model odpověděl textem. Samo o sobě
+    # to nestačí (viz kam_dal), ale bez toho by poslední zpráva byla často jen
+    # další volání nástroje.
     llm_bez_nastroju = chat(modely[0]).with_fallbacks(
         [chat(nahradni) for nahradni in modely[1:]]
     )
@@ -196,8 +267,9 @@ def postav_graf(nastroje: Sequence[BaseTool]):
             )
         odpoved = await model.ainvoke(zpravy)
 
-        model_ktery_odpovedel = odpoved.response_metadata.get("model_name", MODEL)
-        if model_ktery_odpovedel != MODEL:
+        hlavni = rozloz_model(modely[0]).nazev
+        model_ktery_odpovedel = odpoved.response_metadata.get("model_name", hlavni)
+        if model_ktery_odpovedel != hlavni:
             log(f"  (hlavní model selhal, odpověděl náhradní {model_ktery_odpovedel})")
         if VERBOSE and odpoved.content and odpoved.tool_calls:
             # Některé modely posílají úvahu i se zavoláním nástroje.
@@ -231,6 +303,13 @@ def postav_graf(nastroje: Sequence[BaseTool]):
 
     def kam_dal(stav: Stav) -> str:
         """Podmíněná hrana: chce LLM nástroj, nebo je odpověď hotová?"""
+        if stav.get("kroky", 0) > MAX_KROKU:
+            # Poslední kolo (to bez nástrojů) už proběhlo - dál se nepokračuje ani
+            # tehdy, když model volání nástroje napsal znovu. Gemini to dělá:
+            # funkce v požadavku nejsou, ale model je odvodí z historie a pošle
+            # functionCall stejně, takže bez téhle pojistky se smyčka točí až do
+            # recursion_limitu.
+            return END
         return "nastroje" if getattr(stav["messages"][-1], "tool_calls", None) else END
 
     graf = StateGraph(Stav)
@@ -262,25 +341,57 @@ def mcp_spojeni() -> dict[str, Any]:
     }
 
 
-def _vysvetli_chybu(exc: BaseException) -> str:
+def _vysvetli_chybu(exc: BaseException, hlavicka: bool = True) -> str:
     """Místo tracebacku z hloubi knihovny srozumitelná hláška."""
+    # .with_fallbacks() vyhodí chybu prvního modelu, takže bez tohohle není
+    # z výpisu poznat, že se zkoušely i náhradní.
+    uvod = (
+        f"Neodpověděl ani jeden z modelů ({' → '.join(pouzitelne_modely())}).\n"
+        if hlavicka
+        else ""
+    )
+    if isinstance(exc, GraphRecursionError):
+        return (
+            f"Agent se zacyklil - graf vyčerpal recursion_limit dřív, než stihl\n"
+            f"odpovědět. Zkus dotaz rozdělit na menší části, nebo zvedni MAX_KROKU."
+        )
     zprava = " ".join(str(exc).split())
     if isinstance(exc, BaseExceptionGroup):  # anyio balí chyby do skupin
-        zprava = " ".join(_vysvetli_chybu(pod) for pod in exc.exceptions)
+        zprava = " ".join(_vysvetli_chybu(pod, hlavicka=False) for pod in exc.exceptions)
+    if any(
+        hlaska in zprava
+        for hlaska in ("API_KEY_INVALID", "API key not valid", "pass a valid API key")
+    ):
+        return uvod + (
+            "Poskytovatel odmítl API klíč. U Gemini zkontroluj GEMINI_API_KEY v .env -\n"
+            "klíč se vytváří na https://aistudio.google.com/apikey a musí patřit\n"
+            "k projektu, kde je Gemini API zapnuté."
+        )
+    if "RESOURCE_EXHAUSTED" in zprava or "quota" in zprava.lower():
+        return uvod + (
+            "Vyčerpaná kvóta poskytovatele (u Gemini free tieru je strop na minutu\n"
+            "i na den). Zkus to za chvíli znovu, přepni MODEL na menší variantu\n"
+            "(např. google/gemini-3.5-flash-lite), nebo nech naskočit fallback."
+        )
+    if "UNAVAILABLE" in zprava or "503" in zprava:
+        return uvod + (
+            "Model je přetížený (503). Bývá to na pár minut - zkus to znovu, nebo\n"
+            "doplň do FALLBACK_MODELS další model, na který máš klíč."
+        )
     if "free-models-per-day" in zprava:
-        return (
+        return uvod + (
             "Vyčerpaný denní limit free modelů na OpenRouteru (50 požadavků na den,\n"
             "počítadlo se nuluje o půlnoci UTC). Přepnutí modelu nepomůže, limit je\n"
             "na účet. Řešení: počkat, dokoupit kredit, nebo v .env nastavit jiný\n"
             "provider (LLM_BASE_URL + LLM_API_KEY + MODEL)."
         )
     if "429" in zprava or "rate-limited" in zprava:
-        return (
-            "Všechny nastavené modely vrátily 429. Free tier OpenRouteru sdílí kapacitu\n"
-            "se všemi uživateli, takže výpadky jsou běžné - zkus to za chvíli znovu,\n"
+        return uvod + (
+            "Poskytovatel vrátil 429. Free modely na OpenRouteru sdílí kapacitu se\n"
+            "všemi uživateli, takže výpadky jsou běžné - zkus to za chvíli znovu,\n"
             "nebo v .env přepni MODEL / FALLBACK_MODELS (seznam ověřených je v README)."
         )
-    return f"{type(exc).__name__}: {zprava[:400]}"
+    return uvod + f"{type(exc).__name__}: {zprava[:400]}"
 
 
 async def zeptej_se(graf, dotaz: str, vlakno: str = "demo") -> str | None:
@@ -298,7 +409,13 @@ async def zeptej_se(graf, dotaz: str, vlakno: str = "demo") -> str | None:
         print(f"\nDotaz se nepodařilo dokončit.\n{_vysvetli_chybu(exc)}")
         return None
 
-    odpoved = _text(stav["messages"][-1].content)
+    odpoved = _text(stav["messages"][-1].content).strip()
+    if not odpoved:
+        # Poslední zpráva byla samé volání nástroje - text v ní žádný není.
+        odpoved = (
+            f"(Agent nedospěl k odpovědi v limitu {MAX_KROKU} kol. "
+            "Zkus dotaz rozdělit na menší části.)"
+        )
     log("\nOdpověď agenta:")
     print(odpoved, flush=True)
     return odpoved
@@ -336,16 +453,21 @@ async def main() -> None:
     argumenty = [a for a in sys.argv[1:] if a != "--tise"]
     VERBOSE = "--tise" not in sys.argv
 
-    if not LLM_API_KEY:
+    modely = pouzitelne_modely()
+    if not modely:
         sys.exit(
-            "Chybí API klíč k LLM.\n"
-            "  cp .env.example .env  a doplň OPENROUTER_API_KEY "
-            "(klíč zdarma na https://openrouter.ai/keys)."
+            "Ani jeden z nastavených modelů nemá API klíč.\n"
+            "  cp .env.example .env  a doplň aspoň jeden z nich:\n"
+            "    GEMINI_API_KEY      klíč zdarma na https://aistudio.google.com/apikey\n"
+            "    OPENROUTER_API_KEY  klíč zdarma na https://openrouter.ai/keys\n"
+            f"  (nastavené modely: {', '.join([MODEL, *FALLBACK_MODELS])})"
         )
+    if modely[0] != MODEL:
+        print(f"Pozor: {MODEL} nemá klíč, přeskakuji ho.")
     if not (KOREN / "data" / "knihovna.db").exists() and MCP_TRANSPORT != "http":
         sys.exit("Chybí databáze - spusť nejdřív `uv run scripts/build_db.py`.")
 
-    print(f"Model: {MODEL} ({LLM_BASE_URL})")
+    print("Modely: " + " → ".join(modely))
     print(f"MCP: {MCP_TRANSPORT}" + (f" {MCP_URL}" if MCP_TRANSPORT == "http" else ""))
 
     client = MultiServerMCPClient({"knihovna": mcp_spojeni()})

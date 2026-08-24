@@ -7,6 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "langgraph>=0.6.0",
     "langchain-mcp-adapters>=0.1.0",
+    # dva klienti: Gemini jede nativně (kvůli thought signatures u Gemini 3),
+    # všechno ostatní přes OpenAI-kompatibilní API
+    "langchain-google-genai>=3.0",
     "langchain-openai>=0.3.0",
     "mcp>=1.13.0",
     "httpx>=0.27.0",
